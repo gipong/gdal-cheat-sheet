@@ -14,7 +14,7 @@ Or, for all layers
 __Print vector extent__
 
 	ogrinfo input.shp layer-name | grep Extent
-
+	
 __List vector drivers__
 
 	ogr2ogr --formats
@@ -22,6 +22,10 @@ __List vector drivers__
 __Convert between vector formats__
 
 	ogr2ogr -f "GeoJSON" output.json input.shp
+
+__Print count of features with attributes matching a given pattern__
+
+	ogrinfo input.shp layer-name | grep "Search Pattern" | sort | uniq -c
 
 __Clip vectors by bounding box__
 
@@ -38,6 +42,11 @@ __Reproject vector:__
 __Merge features in a vector file by attribute ("dissolve")__
 
 	ogr2ogr -f "ESRI Shapefile" dissolved.shp input.shp -dialect sqlite -sql "select ST_union(Geometry),common_attribute from input GROUP BY common_attribute"
+	
+__Merge features ("dissolve") using a buffer to avoid slivers__
+
+	ogr2ogr -f "ESRI Shapefile" dissolved.shp input.shp -dialect sqlite \
+	-sql "select ST_union(ST_buffer(Geometry,0.001)),common_attribute from input GROUP BY common_attribute"
 
 __Merge vector files:__
 
@@ -58,7 +67,53 @@ __Subset & filter all shapefiles in a directory__
 
 Assumes that filename and name of layer of interest are the same...  
 
-	ls -1 *.shp | sed 's/.shp//g' | xargs -n1 -I % ogr2ogr %-subset.shp %.shp -sql "SELECT field-one, field-two FROM '%' WHERE field-one='value-of-interest'"
+	basename -s.shp *.shp | xargs -n1 -I % ogr2ogr %-subset.shp %.shp -sql "SELECT field-one, field-two FROM '%' WHERE field-one='value-of-interest'"
+
+__Extract data from a PostGis database to a GeoJSON file__
+
+	ogr2ogr -f "GeoJSON" file.geojson PG:"host=localhost dbname=database user=user password=password" \
+	-sql "SELECT * from table_name"
+
+__Get the difference between two vector files__
+
+Create a `layers.vrt` file that looks like:
+
+```
+<OGRVRTDataSource>
+	<OGRVRTLayer name="file1">
+		<SrcDataSource>file1.shp</SrcDataSource>
+	</OGRVRTLayer>
+	<OGRVRTLayer name="file2">
+		<SrcDataSource>file2.shp</SrcDataSource>
+	</OGRVRTLayer>
+</OGRVRTDataSource>
+```
+
+Then run:
+
+	ogr2ogr -f "ESRI Shapefile" difference.shp layers.vrt -dialect sqlite \
+	-sql "SELECT ST_Difference(file1.geometry,file2.geometry) AS geometry FROM file1,file2"
+
+This will produce a vector file with the part of `file1.shp` that doesn't intersect with `file2.shp`.
+
+Or, do it all as a one-liner:
+
+	SUBTRACT_FROM_SHP=file1 SUBTRACT_SHP=file2; \
+	echo '<OGRVRTDataSource><OGRVRTLayer name="'$SUBTRACT_FROM_SHP'"><SrcDataSource>'$SUBTRACT_FROM_SHP'.shp</SrcDataSource></OGRVRTLayer><OGRVRTLayer name="'$SUBTRACT_SHP'"><SrcDataSource>'$SUBTRACT_SHP'.shp</SrcDataSource></OGRVRTLayer></OGRVRTDataSource>' | \
+	ogr2ogr -f "ESRI Shapefile" difference.shp /vsistdin/ -dialect sqlite \
+	-sql "SELECT ST_Difference($SUBTRACT_FROM_SHP.geometry,$SUBTRACT_SHP.geometry) AS geometry FROM $SUBTRACT_FROM_SHP,$SUBTRACT_SHP"
+
+__Spatial join:__
+
+A spatial join transfers properties from one vector layer to another based on a [spatial relationship](http://postgis.net/docs/manual-2.0/reference.html#Spatial_Relationships_Measurements) between the features. Fields from the join layer can be [aggregated](https://www.sqlite.org/lang_aggfunc.html) in the output.
+
+Given a set of points (trees.shp) and a set of polygons (parks.shp) in the same directory, create a polygon layer with the geometries from parks.shp and summaries of some columns in trees.shp:
+
+    ogr2ogr -f 'ESRI Shapefile' output.shp parks.shp -dialect sqlite \
+    -sql "SELECT p.Geometry, p.id id, SUM(t.field1) field1_sum, AVG(t.field2) field2_avg
+    FROM parks p, 'trees.shp'.trees t WHERE ST_Contains(p.Geometry, t.Geometry) GROUP BY p.id"
+
+Note that features that from parks.shp that don't overlap with trees.shp won't be in the new file.
 
 Raster operations
 ---
@@ -69,6 +124,14 @@ __Get raster information__
 __List raster drivers__
 
 	gdal_translate --formats
+	
+__Force creation of world file (requires libgeotiff)__
+
+	listgeo -tfw  mappy.tif
+	
+__Report PROJ.4 projection info, including bounding box (requires libgeotiff)__
+
+	listgeo -proj4 mappy.tif
 
 __Convert between raster formats__
 
@@ -83,9 +146,9 @@ You can change '0' and '65535' to your image's actual min/max values to preserve
 
 	gdalinfo -mm input.tif | grep Min/Max
 	
-__Convert a directory of files to a different raster format__
+__Convert a directory of raster files of the same format to another raster format__
 
-	ls -1 *.img | sed 's/.img//g' | xargs -n1 -I % gdal_translate -of "GTiff" %.img %.tif
+	basename -s.img *.img | xargs -n1 -I % gdal_translate -of "GTiff" %.img %.tif
 
 __Reproject raster:__
 
@@ -95,7 +158,8 @@ Be sure to add _-r bilinear_ if reprojecting elevation data to prevent funky ban
 
 __Georeference an unprojected image with known bounding coordinates:__
 
-	gdal_translate -of GTiff -a_ullr <top_left_lon> <top_left_lat> <bottom_right_lon> <bottom_right_lat> -a_srs EPSG:4269 input.png output.tif
+	gdal_translate -of GTiff -a_ullr <top_left_lon> <top_left_lat> <bottom_right_lon> <bottom_right_lat> \
+	-a_srs EPSG:4269 input.png output.tif
 
 __Clip raster by bounding box__
 
@@ -190,13 +254,23 @@ Finally, color the slope raster based on angles in color-slope.txt:
 
 __Resample (resize) raster__
 
-	gdalwarp -ts <width> <height> -r cubicspline dem.tif resampled_dem.tif
+	gdalwarp -ts <width> <height> -r cubic dem.tif resampled_dem.tif
 
 Entering 0 for either width or height guesses based on current dimensions.
+
+Alternatively,
+	
+	gdal_translate -outsize 10% 10% -r cubic dem.tif resampled_dem.tif
+
+For both of these, `-r cubic` specifies cubic interpolation: when resampling continuous data (like a DEM), the default nearest neighbor interpolation can result in "stair step" artifacts.
 
 __Burn vector into raster__
 
 	gdal_rasterize -b 1 -i -burn -32678 -l layername input.shp input.tif
+
+__Extract polygons from raster__
+
+	gdal_polygonize.py input.tif -f "GeoJSON" output.json
 
 __Create contours from DEM__
 
@@ -206,6 +280,12 @@ __Get values for a specific location in a raster__
 
 	gdallocationinfo -xml -wgs84 input.tif <lon> <lat>  
 
+__Convert GRIB band to .tif__
+	
+Assumes data for entire globe in WGS84. Be sure to specify band, or you may end up with a nonsense RGB image composed of the first three.
+
+	gdal_translate input.grib -a_ullr -180 -90 180 90 -a_srs EPSG:4326 -b 1 output_band1.tif
+	
 
 Other
 ---
@@ -258,10 +338,6 @@ __MODIS operations__
 
 First, download relevant .hdf tiles from the MODIS ftp site: <ftp://ladsftp.nascom.nasa.gov/>; use the [MODIS sinusoidal grid](http://www.geohealth.ou.edu/modis_v5/modis.shtml) for reference.
 
-Create a file containing the names of all .hdf files in the directory
-
-	ls -1 *.hdf > files.txt
-
 List MODIS Subdatasets in a given HDF (conf. the [MODIS products table](https://lpdaac.usgs.gov/products/modis_products_table/))
 
 	gdalinfo longFileName.hdf | grep SUBDATASET
@@ -269,12 +345,11 @@ List MODIS Subdatasets in a given HDF (conf. the [MODIS products table](https://
 Make TIFs from each file in list; replace 'MOD12Q1:Land_Cover_Type_1' with desired Subdataset name
 
 	mkdir output
-	cat files.txt | xargs -I % -n1 gdalwarp -of GTiff 'HDF4_EOS:EOS_GRID:%:MOD12Q1:Land_Cover_Type_1' output/%.tif
+	find . '*.hdf' -exec gdalwarp -of GTiff 'HDF4_EOS:EOS_GRID:"{}":MOD12Q1:Land_Cover_Type_1' output/{}.tif \;
 
 Merge all .tifs in output directory into single file
 
-	cd output
-	gdal_merge.py -o Merged_Landcover.tif *.tif
+	gdal_merge.py -o output/Merged_Landcover.tif output/*.tif
 
 __BASH functions__  
 _Size Functions_  
